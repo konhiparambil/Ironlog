@@ -201,6 +201,9 @@
   label.check input{width:20px;height:20px;flex:0 0 auto;accent-color:var(--volt);}
   .addrow{display:flex;gap:8px;margin-top:12px;align-items:center;}
   .addrow input{flex:1;}
+  .addrow select{flex:0 0 auto;max-width:42%;}
+  .libhead{font-family:'Anton';font-size:12px;letter-spacing:1px;color:var(--volt-dim);
+    text-transform:uppercase;margin:14px 0 2px;}
 </style>
 </head>
 <body>
@@ -347,6 +350,10 @@
       <button class="btn btn-primary" id="saveApi">Save & sync</button>
       <button class="btn btn-ghost" id="pullApi">Pull now</button>
     </div>
+    <div class="row-actions" style="margin-top:8px;">
+      <button class="btn btn-danger" id="replaceApi">Replace this phone's data with the Sheet</button>
+    </div>
+    <p class="small muted" style="margin:6px 0 0;">Use after cleaning rows directly in the Sheet — overwrites this phone with exactly what the Sheet has. Run it on both phones.</p>
     <div id="syncStatus" class="status info">Local-only mode.</div>
 
     <div class="hr"></div>
@@ -385,7 +392,9 @@ const WARMUP = {
 };
 
 /* Options available when assigning a muscle group to a weekday. */
-const SCHED_OPTS = ['Legs','Chest + Triceps','Core + Movements','Back + Biceps','Shoulder + Squats','Optional'];
+/* Day types available when assigning a weekday: presets + user-created custom days. */
+const BASE_DAYS = ['Legs','Chest + Triceps','Core + Movements','Back + Biceps','Shoulder + Squats'];
+function schedOpts(){ return BASE_DAYS.concat(state.customDays||[]).concat(['Optional']); }
 function defaultSchedule(){ return Object.assign({}, PLAN); }
 function scheduleFor(person){
   if(!state.schedules) state.schedules={};
@@ -453,6 +462,7 @@ let state = {
   schedules:{},   // per-person weekday->group map e.g. {Anjali:{1:'Legs',...}}
   routines:{},    // per-person group->exercise-names e.g. {Anjali:{Legs:['Goblet Squat',...]}}
   loadTypes:{},   // exercise-name -> 'bar' | 'bw' (shared); affects volume calc only
+  customDays:[],  // user-named day types e.g. ['Full Body','Arms'] (shared)
   workouts:[],    // [{id,person,date,dayType,exercise,w1,r1,w2,r2,w3,r3,notes,ts}]
   body:[]         // [{id,person,date,weight,height,bf,notes,ts}]
 };
@@ -554,6 +564,7 @@ function loadLocal(){
   }
   if(!state.persons || state.persons.length<2) state.persons=['Anjali','Deepak'];
   if(!state.persons.includes(state.currentPerson)) state.currentPerson = state.persons[0];
+  if(!Array.isArray(state.customDays)) state.customDays=[];
   // Repair any date strings corrupted by earlier sheet round-trips.
   (state.workouts||[]).forEach(w=>{ w.date=cleanDate(w.date); });
   (state.body||[]).forEach(b=>{ b.date=cleanDate(b.date); });
@@ -582,30 +593,43 @@ async function apiPost(action, data){
   }finally{ syncBusy=false; }
 }
 
-async function apiLoad(){
+async function apiLoad(replace){
+  replace = replace === true; // guard: event objects from onclick must not trigger replace
   if(!state.apiUrl){ setSync('Local-only mode.','info'); return; }
-  setSync('Syncing…','info'); setDot('busy');
+  setSync(replace?'Replacing local data from Sheet…':'Syncing…','info'); setDot('busy');
   try{
     const url = state.apiUrl + (state.apiUrl.includes('?')?'&':'?') + 'action=load&t='+Date.now();
     const r = await fetch(url, {method:'GET'});
     const j = await r.json();
     if(j && j.ok!==false){
-      // MERGE sheet data with local (never blind-replace): local records the
-      // sheet doesn't have yet are kept and pushed up, so a failed or missed
+      // Default = MERGE sheet data with local (never blind-replace): local records
+      // the sheet doesn't have yet are kept and pushed up, so a failed or missed
       // upload can no longer be wiped out by a pull.
+      // replace=true = the Sheet is the truth: local-only records are discarded.
+      // Use it after deliberately deleting rows in the Sheet.
       function mergeRows(localArr, remoteArr, pushAction){
         const remoteIds=new Set(remoteArr.map(r=>String(r.id)));
         const extras=(localArr||[]).filter(l=> l && l.id!=null && !remoteIds.has(String(l.id)));
         extras.forEach(x=> apiPost(pushAction, x));
         return remoteArr.concat(extras);
       }
-      if(Array.isArray(j.workouts)) state.workouts = mergeRows(state.workouts, j.workouts.map(normalizeWorkout), 'upsertWorkout');
-      if(Array.isArray(j.body)) state.body = mergeRows(state.body, j.body.map(normalizeBody), 'upsertBody');
-      if(Array.isArray(j.exercises)) state.custom = mergeRows(state.custom, j.exercises.map(e=>({id:e.id,dayType:e.dayType,name:e.name})), 'upsertExercise');
+      const rw = Array.isArray(j.workouts)? j.workouts.map(normalizeWorkout) : null;
+      const rb = Array.isArray(j.body)? j.body.map(normalizeBody) : null;
+      const re = Array.isArray(j.exercises)? j.exercises.map(e=>({id:e.id,dayType:e.dayType,name:e.name})) : null;
+      if(replace){
+        if(rw) state.workouts = rw;
+        if(rb) state.body = rb;
+        if(re) state.custom = re;
+      }else{
+        if(rw) state.workouts = mergeRows(state.workouts, rw, 'upsertWorkout');
+        if(rb) state.body = mergeRows(state.body, rb, 'upsertBody');
+        if(re) state.custom = mergeRows(state.custom, re, 'upsertExercise');
+      }
       if(j.config){
         if(j.config.persons){ try{ const p=JSON.parse(j.config.persons); if(Array.isArray(p)&&p.length) state.persons=p; }catch(e){} }
         if(j.config.hidden){ try{ const h=JSON.parse(j.config.hidden); if(Array.isArray(h)) state.hidden=h; }catch(e){} }
         if(j.config.loadtypes){ try{ const lt=JSON.parse(j.config.loadtypes); if(lt&&typeof lt==='object') state.loadTypes=lt; }catch(e){} }
+        if(j.config.customdays){ try{ const cdz=JSON.parse(j.config.customdays); if(Array.isArray(cdz)) state.customDays=cdz; }catch(e){} }
         Object.keys(j.config).forEach(k=>{
           if(k.indexOf('schedule:')===0){
             const person=k.slice(9);
@@ -618,7 +642,7 @@ async function apiLoad(){
         });
       }
       saveLocal();
-      setSync('Synced from Google Sheets.','ok'); setDot('on');
+      setSync(replace?'This phone now matches the Sheet exactly.':'Synced from Google Sheets.','ok'); setDot('on');
       renderAll();
     }else{
       setSync('Sheet responded but with an error: '+(j&&j.error||'unknown'),'err'); setDot('off');
@@ -682,7 +706,7 @@ function renderToday(){
 
   // small warmup suggestion (footnote style)
   const warm=document.createElement('div'); warm.className='warmup';
-  warm.innerHTML='<span class="ast">*</span> Warm up first \u2014 '+escapeHtml(WARMUP[group]||WARMUP['Optional']);
+  warm.innerHTML='<span class="ast">*</span> Warm up first \u2014 '+escapeHtml(WARMUP[group]|| (group==='Optional'?WARMUP['Optional']:'5 min easy cardio, dynamic stretches, then 1\u20132 light ramp-up sets per movement.'));
   list.appendChild(warm);
   todayPrefill = [];
 
@@ -729,25 +753,43 @@ function renderToday(){
   }
 
   routine.forEach(name=> appendExerciseCard(list, name, group, iso));
+
+  // one-offs: anything logged today that isn't part of the routine
+  const extras = state.workouts.filter(w=> w.person===state.currentPerson && w.date===iso && !routine.includes(w.exercise));
+  if(extras.length){
+    const t=document.createElement('div'); t.className='section-title'; t.textContent='One-off today';
+    list.appendChild(t);
+    extras.forEach(w=> appendExerciseCard(list, w.exercise, group, iso));
+  }
+  // picker to log an extra exercise just for today, without changing the routine
+  const oneoff=document.createElement('div'); oneoff.className='card';
+  const os=document.createElement('select');
+  os.innerHTML='<option value="">+ Add a one-off exercise for today…</option>'+library()
+    .filter(e=> !routine.includes(e.name) && !extras.some(x=>x.exercise===e.name))
+    .sort((a,b)=>a.name.localeCompare(b.name))
+    .map(e=>'<option value="'+escapeAttr(e.name)+'">'+escapeHtml(e.name)+' — '+escapeHtml(e.dayType)+'</option>').join('');
+  os.onchange=()=>{ if(os.value){ ensureWorkoutRow(os.value, group, iso); renderToday(); } };
+  oneoff.appendChild(os);
+  const hint=document.createElement('p'); hint.className='small muted'; hint.style.margin='8px 0 0';
+  hint.textContent='Logs it for today only \u2014 your '+group+' routine stays unchanged.';
+  oneoff.appendChild(hint);
+  list.appendChild(oneoff);
 }
 
 /* Checklist to pick which exercises this person does for a group. */
 function buildRoutineEditor(group, iso){
   const person = state.currentPerson;
-  const routine = routineFor(person, group);
   const panel=document.createElement('div'); panel.className='card';
-  panel.innerHTML='<p class="small muted" style="margin:0 0 10px;">Tick what <b>'+escapeHtml(person)+'</b> does on '+escapeHtml(group)+' day. This list is personal — '+escapeHtml(person)+' and the other person can have different exercises.</p>';
-
-  const names = exercisesFor(group).map(e=>e.name);
-  routine.forEach(n=>{ if(!names.includes(n)) names.push(n); }); // keep any custom/hidden ones already chosen
-  names.sort((a,b)=>a.localeCompare(b));
+  panel.innerHTML='<p class="small muted" style="margin:0 0 10px;">Tick what <b>'+escapeHtml(person)+'</b> does on <b>'+escapeHtml(group)+'</b> day — you can pick from any muscle group. This list is personal.</p>';
 
   const countLbl=()=>{ const r=routineFor(person,group); return r.length+' selected'; };
   const counter=document.createElement('div'); counter.className='small muted'; counter.style.margin='0 0 8px'; counter.textContent=countLbl();
+  panel.appendChild(counter);
 
-  names.forEach(name=>{
+  const lib=library();
+  function addRow(name){
     const row=document.createElement('label'); row.className='check';
-    const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=routine.includes(name);
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=routineFor(person,group).includes(name);
     cb.onchange=()=>{
       let r=routineFor(person,group).slice();
       if(cb.checked){ if(!r.includes(name)) r.push(name); } else { r=r.filter(x=>x!==name); }
@@ -757,21 +799,37 @@ function buildRoutineEditor(group, iso){
     const span=document.createElement('span'); span.textContent=name;
     row.appendChild(cb); row.appendChild(span);
     panel.appendChild(row);
+  }
+  // categories, with the day's own category first when it is one
+  const cats=GROUPS.filter(c=> lib.some(e=>e.dayType===c));
+  if(cats.includes(group)){ cats.splice(cats.indexOf(group),1); cats.unshift(group); }
+  cats.forEach(cat=>{
+    const hd=document.createElement('div'); hd.className='libhead'; hd.textContent=cat;
+    panel.appendChild(hd);
+    lib.filter(e=>e.dayType===cat).map(e=>e.name).sort((a,b)=>a.localeCompare(b)).forEach(addRow);
   });
-  panel.insertBefore(counter, panel.children[1]||null);
+  // anything chosen earlier that's since been hidden/removed from the library
+  const orphan=routineFor(person,group).filter(n=> !lib.some(e=>e.name===n));
+  if(orphan.length){
+    const hd=document.createElement('div'); hd.className='libhead'; hd.textContent='Previously chosen';
+    panel.appendChild(hd); orphan.forEach(addRow);
+  }
 
-  // add a brand-new exercise and include it
+  // add a brand-new exercise to the library (under a chosen category) and include it
   const addWrap=document.createElement('div'); addWrap.className='addrow';
-  const ai=document.createElement('input'); ai.type='text'; ai.placeholder='New exercise (adds to library)…';
-  const ab=document.createElement('button'); ab.className='btn btn-primary btn-sm'; ab.textContent='Add & include';
+  const ai=document.createElement('input'); ai.type='text'; ai.placeholder='New exercise…';
+  const acat=document.createElement('select');
+  const defCat = GROUPS.includes(group) ? group : 'Other';
+  acat.innerHTML=GROUPS.map(g=>'<option'+(g===defCat?' selected':'')+'>'+escapeHtml(g)+'</option>').join('');
+  const ab=document.createElement('button'); ab.className='btn btn-primary btn-sm'; ab.textContent='Add';
   ab.onclick=()=>{
     const nm=ai.value.trim(); if(!nm) return;
-    if(!exercisesFor(group).some(e=>e.name.toLowerCase()===nm.toLowerCase())) addExercise(nm, group);
+    if(!library().some(e=>e.name.toLowerCase()===nm.toLowerCase())) addExercise(nm, acat.value);
     let r=routineFor(person,group).slice(); if(!r.includes(nm)) r.push(nm);
     saveRoutine(person, group, r);
     routineEditorOpen=true; renderToday();
   };
-  addWrap.appendChild(ai); addWrap.appendChild(ab);
+  addWrap.appendChild(ai); addWrap.appendChild(acat); addWrap.appendChild(ab);
   panel.appendChild(addWrap);
 
   const done=document.createElement('button'); done.className='btn btn-primary'; done.style.marginTop='12px';
@@ -893,8 +951,22 @@ function renderWeek(){
 
     const grp=document.createElement('div'); grp.className='grp';
     const sel=document.createElement('select'); sel.className='daysel';
-    sel.innerHTML=SCHED_OPTS.map(g=>'<option'+(g===group?' selected':'')+'>'+escapeHtml(g)+'</option>').join('');
-    sel.onchange=()=>{ setScheduleDay(dow, sel.value); renderWeek(); if(dow===todayDow) renderToday(); };
+    sel.innerHTML=schedOpts().map(g=>'<option'+(g===group?' selected':'')+'>'+escapeHtml(g)+'</option>').join('')
+      +'<option value="__new__">+ New day type…</option>';
+    sel.onchange=()=>{
+      if(sel.value==='__new__'){
+        const nm=(prompt('Name the new day type (e.g. Full Body, Upper Body, Arms):')||'').trim();
+        if(nm){
+          if(!schedOpts().includes(nm)){
+            state.customDays.push(nm); saveLocal();
+            apiPost('setConfig',{id:'customdays', value:JSON.stringify(state.customDays)});
+          }
+          setScheduleDay(dow, nm);
+        }
+        renderWeek(); if(dow===todayDow) renderToday(); return;
+      }
+      setScheduleDay(dow, sel.value); renderWeek(); if(dow===todayDow) renderToday();
+    };
     const meta=document.createElement('small');
     meta.textContent = group==='Optional' ? 'optional / rest' : (exCount? exCount+' exercise'+(exCount===1?'':'s') : 'tap Today to pick exercises');
     grp.appendChild(sel); grp.appendChild(meta);
@@ -1031,6 +1103,32 @@ function renderManage(){
   const gsel=$('#newExGroup');
   if(!gsel.options.length) gsel.innerHTML=GROUPS.map(g=>'<option>'+g+'</option>').join('');
   const list=$('#manageList'); list.innerHTML='';
+  // custom day types
+  const dayCard=document.createElement('div'); dayCard.className='card';
+  dayCard.innerHTML='<h3 style="font-size:15px;margin-bottom:8px;">Custom day types</h3>';
+  if(!(state.customDays||[]).length){
+    const p=document.createElement('p'); p.className='small muted'; p.style.margin='0';
+    p.textContent='None yet. Create one from any day\u2019s dropdown in the Week tab (\u201c+ New day type\u2026\u201d).';
+    dayCard.appendChild(p);
+  }else{
+    state.customDays.forEach(nm=>{
+      const chip=document.createElement('span'); chip.className='chip';
+      chip.innerHTML=escapeHtml(nm)+' <button title="remove">✕</button>';
+      chip.querySelector('button').onclick=()=>{
+        if(!confirm('Remove day type "'+nm+'"? Weekdays using it revert to Optional. Past logs are kept.')) return;
+        state.customDays=state.customDays.filter(x=>x!==nm);
+        Object.keys(state.schedules||{}).forEach(p=>{
+          const sc=state.schedules[p]; let changed=false;
+          Object.keys(sc).forEach(d=>{ if(sc[d]===nm){ sc[d]='Optional'; changed=true; } });
+          if(changed) apiPost('setConfig',{id:'schedule:'+p, value:JSON.stringify(sc)});
+        });
+        saveLocal(); apiPost('setConfig',{id:'customdays', value:JSON.stringify(state.customDays)});
+        renderManage(); renderWeek(); renderToday();
+      };
+      dayCard.appendChild(chip);
+    });
+  }
+  list.appendChild(dayCard);
   GROUPS.forEach(g=>{
     const items=library().filter(e=>e.dayType===g);
     if(items.length===0) return;
@@ -1194,7 +1292,11 @@ function init(){
     state.apiUrl=$('#apiUrl').value.trim(); saveLocal();
     if(state.apiUrl){ await apiLoad(); } else { setSync('Local-only mode.','info'); setDot('off'); }
   };
-  $('#pullApi').onclick=apiLoad;
+  $('#pullApi').onclick=()=>apiLoad();
+  $('#replaceApi').onclick=()=>{
+    if(!state.apiUrl){ alert('Connect a Web App URL first.'); return; }
+    if(confirm('Replace ALL data on this phone with what\u2019s in the Google Sheet?\n\nAnything logged on this phone that never synced will be lost. Use this after deliberately deleting rows in the Sheet \u2014 and run it on the other phone too.')) apiLoad(true);
+  };
 
   $('#progressEx').onchange=e=>drawProgress(e.target.value);
 
