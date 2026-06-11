@@ -190,6 +190,9 @@
   .chip{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line);
     border-radius:999px;padding:6px 10px;font-size:13px;margin:0 6px 8px 0;}
   .chip button{background:none;border:none;color:var(--danger);font-size:15px;cursor:pointer;padding:0 2px;}
+  .chip button.bwtog{color:var(--muted);border:1px solid var(--line);border-radius:6px;font-size:9px;
+    letter-spacing:.5px;padding:2px 6px;font-weight:800;}
+  .chip button.bwtog.on{color:#13160a;background:var(--volt);border-color:var(--volt);}
   .routine-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;
     font-size:13px;color:var(--muted);}
   .routine-head b{color:var(--text);}
@@ -293,6 +296,7 @@
   <!-- MANAGE -->
   <section class="view" id="view-manage">
     <h2 style="margin-bottom:10px;">Exercises</h2>
+    <p class="small muted" style="margin:0 0 12px;">Tap <b>BW</b> on an exercise to count it as bodyweight in volume totals (your latest logged bodyweight + any added weight). Everything else counts the weight exactly as you enter it.</p>
     <div class="card">
       <div class="field"><label>New exercise name</label><input id="newExName" type="text" placeholder="e.g. Hack Squat"></div>
       <div class="field"><label>Add to day</label><select id="newExGroup"></select></div>
@@ -448,6 +452,7 @@ let state = {
   hidden:[],      // hidden default exercise ids
   schedules:{},   // per-person weekday->group map e.g. {Anjali:{1:'Legs',...}}
   routines:{},    // per-person group->exercise-names e.g. {Anjali:{Legs:['Goblet Squat',...]}}
+  loadTypes:{},   // exercise-name -> 'bar' | 'bw' (shared); affects volume calc only
   workouts:[],    // [{id,person,date,dayType,exercise,w1,r1,w2,r2,w3,r3,notes,ts}]
   body:[]         // [{id,person,date,weight,height,bf,notes,ts}]
 };
@@ -459,7 +464,25 @@ const $$ = s=>Array.from(document.querySelectorAll(s));
 const uid = ()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 const todayISO = ()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');};
 const num = v=>{const n=parseFloat(v);return isNaN(n)?null:n;};
-function isoToDate(iso){const [y,m,d]=iso.split('-').map(Number);return new Date(y,m-1,d);}
+function cleanDate(v){ // coerce any incoming date value to 'YYYY-MM-DD'
+  if(v===''||v==null) return '';
+  const s=String(v);
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if(/\d{4}-\d{2}-\d{2}T/.test(s)){
+    // Full timestamp (e.g. from a Sheets date cell serialized in UTC):
+    // convert to this device's local calendar day so the day doesn't shift.
+    const d=new Date(s);
+    if(!isNaN(d.getTime())) return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  }
+  const m=s.match(/\d{4}-\d{2}-\d{2}/);
+  return m ? m[0] : s.slice(0,10);
+}
+function isoToDate(iso){
+  const s=cleanDate(iso);
+  const p=s.split('-').map(Number);
+  if(p.length!==3 || p.some(isNaN)) return new Date(NaN);
+  return new Date(p[0], p[1]-1, p[2]);
+}
 function epley(w,r){ if(!w||!r) return null; return w*(1+r/30); }
 
 function library(){
@@ -468,6 +491,48 @@ function library(){
 }
 function exercisesFor(dayType){
   return library().filter(e=>e.dayType===dayType);
+}
+
+/* Load type affects only the kg·reps volume metric (not displayed weight or charts).
+   'bar' = use weight exactly as entered (for dumbbells, enter the total yourself);
+   'bw'  = bodyweight exercise: latest logged bodyweight + any added weight.
+   Best-guess defaults below — adjustable per exercise in the Edit tab. */
+const DEFAULT_LOAD = {
+  'Push-up':'bw','Dips':'bw','Pull-up':'bw','Chin-up':'bw','Plank':'bw','Hanging Leg Raise':'bw',
+  'Mountain Climbers':'bw','Dead Hang':'bw','Box Jump':'bw'
+};
+const LOAD_LABEL = {bar:'Weight as entered', bw:'Bodyweight (+added)'};
+function effLoadType(name){
+  if(state.loadTypes && state.loadTypes[name]) return state.loadTypes[name];
+  return DEFAULT_LOAD[name] || 'bar';
+}
+function setLoadType(name, type){
+  if(!state.loadTypes) state.loadTypes={};
+  state.loadTypes[name]=type;
+  saveLocal();
+  apiPost('setConfig',{id:'loadtypes', value:JSON.stringify(state.loadTypes)});
+  renderWeek(); renderHistory();
+}
+function bodyweightFor(person, date){
+  const rows=state.body.filter(b=>b.person===person && num(b.weight)!=null);
+  if(!rows.length) return 0;
+  const desc=rows.slice().sort((a,b)=> a.date<b.date?1:-1);
+  const onBefore=desc.find(b=> b.date<=date);
+  const pick = onBefore || desc[desc.length-1];
+  return num(pick.weight)||0;
+}
+/* Volume (kg·reps) for one workout row, accounting for load type. */
+function workoutVolume(w){
+  const type=effLoadType(w.exercise);
+  const bw = type==='bw' ? bodyweightFor(w.person, w.date) : 0;
+  let v=0;
+  [['w1','r1'],['w2','r2'],['w3','r3']].forEach(([wk,rk])=>{
+    const rv=num(w[rk]); if(!rv) return;
+    const wv=num(w[wk])||0;
+    const load = type==='bw' ? bw+wv : wv;
+    if(load>0) v += load*rv;
+  });
+  return v;
 }
 
 /* ---------- persistence ---------- */
@@ -489,6 +554,9 @@ function loadLocal(){
   }
   if(!state.persons || state.persons.length<2) state.persons=['Anjali','Deepak'];
   if(!state.persons.includes(state.currentPerson)) state.currentPerson = state.persons[0];
+  // Repair any date strings corrupted by earlier sheet round-trips.
+  (state.workouts||[]).forEach(w=>{ w.date=cleanDate(w.date); });
+  (state.body||[]).forEach(b=>{ b.date=cleanDate(b.date); });
 }
 
 /* ---------- remote sync (Google Sheets via Apps Script) ---------- */
@@ -522,12 +590,22 @@ async function apiLoad(){
     const r = await fetch(url, {method:'GET'});
     const j = await r.json();
     if(j && j.ok!==false){
-      if(Array.isArray(j.workouts)) state.workouts = j.workouts.map(normalizeWorkout);
-      if(Array.isArray(j.body)) state.body = j.body.map(normalizeBody);
-      if(Array.isArray(j.exercises)) state.custom = j.exercises.map(e=>({id:e.id,dayType:e.dayType,name:e.name}));
+      // MERGE sheet data with local (never blind-replace): local records the
+      // sheet doesn't have yet are kept and pushed up, so a failed or missed
+      // upload can no longer be wiped out by a pull.
+      function mergeRows(localArr, remoteArr, pushAction){
+        const remoteIds=new Set(remoteArr.map(r=>String(r.id)));
+        const extras=(localArr||[]).filter(l=> l && l.id!=null && !remoteIds.has(String(l.id)));
+        extras.forEach(x=> apiPost(pushAction, x));
+        return remoteArr.concat(extras);
+      }
+      if(Array.isArray(j.workouts)) state.workouts = mergeRows(state.workouts, j.workouts.map(normalizeWorkout), 'upsertWorkout');
+      if(Array.isArray(j.body)) state.body = mergeRows(state.body, j.body.map(normalizeBody), 'upsertBody');
+      if(Array.isArray(j.exercises)) state.custom = mergeRows(state.custom, j.exercises.map(e=>({id:e.id,dayType:e.dayType,name:e.name})), 'upsertExercise');
       if(j.config){
         if(j.config.persons){ try{ const p=JSON.parse(j.config.persons); if(Array.isArray(p)&&p.length) state.persons=p; }catch(e){} }
         if(j.config.hidden){ try{ const h=JSON.parse(j.config.hidden); if(Array.isArray(h)) state.hidden=h; }catch(e){} }
+        if(j.config.loadtypes){ try{ const lt=JSON.parse(j.config.loadtypes); if(lt&&typeof lt==='object') state.loadTypes=lt; }catch(e){} }
         Object.keys(j.config).forEach(k=>{
           if(k.indexOf('schedule:')===0){
             const person=k.slice(9);
@@ -551,12 +629,12 @@ async function apiLoad(){
   }
 }
 function normalizeWorkout(w){
-  return {id:String(w.id),person:w.person,date:w.date,dayType:w.dayType,exercise:w.exercise,
+  return {id:String(w.id),person:w.person,date:cleanDate(w.date),dayType:w.dayType,exercise:w.exercise,
     w1:numOrEmpty(w.w1),r1:numOrEmpty(w.r1),w2:numOrEmpty(w.w2),r2:numOrEmpty(w.r2),
     w3:numOrEmpty(w.w3),r3:numOrEmpty(w.r3),notes:w.notes||'',ts:w.ts||''};
 }
 function normalizeBody(b){
-  return {id:String(b.id),person:b.person,date:b.date,weight:numOrEmpty(b.weight),
+  return {id:String(b.id),person:b.person,date:cleanDate(b.date),weight:numOrEmpty(b.weight),
     height:numOrEmpty(b.height),bf:numOrEmpty(b.bf),notes:b.notes||'',ts:b.ts||''};
 }
 function numOrEmpty(v){ if(v===''||v===null||v===undefined) return ''; const n=parseFloat(v); return isNaN(n)?'':n; }
@@ -845,9 +923,7 @@ function renderWeek(){
       const d=isoToDate(w.date);
       if(d>=from && d<=to){
         sessions.add(w.date);
-        [['w1','r1'],['w2','r2'],['w3','r3']].forEach(([wk,rk])=>{
-          const wv=num(w[wk]), rv=num(w[rk]); if(wv&&rv) v+=wv*rv;
-        });
+        v += workoutVolume(w);
       }
     });
     return {v:Math.round(v), sessions:sessions.size};
@@ -962,8 +1038,12 @@ function renderManage(){
     sec.innerHTML='<h3 style="font-size:15px;margin-bottom:8px;">'+escapeHtml(g)+'</h3>';
     items.sort((a,b)=>a.name.localeCompare(b.name)).forEach(e=>{
       const chip=document.createElement('span'); chip.className='chip';
-      chip.innerHTML=escapeHtml(e.name)+' <button title="remove">✕</button>';
-      chip.querySelector('button').onclick=()=>{ removeExercise(e); renderManage(); renderToday(); };
+      const isBw = effLoadType(e.name)==='bw';
+      chip.innerHTML=escapeHtml(e.name)+
+        ' <button class="bwtog'+(isBw?' on':'')+'" title="'+(isBw?'Counts bodyweight + added weight in volume. Tap to switch.':'Counts weight as entered. Tap to mark as bodyweight.')+'">BW</button>'+
+        ' <button class="rm" title="remove">✕</button>';
+      chip.querySelector('.bwtog').onclick=()=>{ setLoadType(e.name, isBw?'bar':'bw'); renderManage(); };
+      chip.querySelector('.rm').onclick=()=>{ removeExercise(e); renderManage(); renderToday(); };
       sec.appendChild(chip);
     });
     list.appendChild(sec);
@@ -997,7 +1077,7 @@ function removeExercise(e){
 /* ---------- escape + format ---------- */
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function escapeAttr(s){ return escapeHtml(s); }
-function fmtShort(iso){ try{ const d=isoToDate(iso); return d.toLocaleDateString(undefined,{day:'numeric',month:'short'}); }catch(e){ return iso; } }
+function fmtShort(iso){ const d=isoToDate(iso); if(isNaN(d.getTime())) return cleanDate(iso)||'—'; return d.toLocaleDateString(undefined,{day:'numeric',month:'short'}); }
 
 /* ---------- history ---------- */
 let histWeekStart = null;
@@ -1023,7 +1103,7 @@ function renderHistory(){
   const rows = state.workouts.filter(w=> w.person===state.currentPerson && w.date>=startISO && w.date<=endISO && hasAnySet(w));
 
   let vol=0; const days=new Set();
-  rows.forEach(w=>{ days.add(w.date); [['w1','r1'],['w2','r2'],['w3','r3']].forEach(([wk,rk])=>{ const wv=num(w[wk]),rv=num(w[rk]); if(wv&&rv) vol+=wv*rv; }); });
+  rows.forEach(w=>{ days.add(w.date); vol += workoutVolume(w); });
   $('#histSummary').innerHTML = rows.length
     ? '<div class="small muted"><b style="color:var(--text)">'+escapeHtml(state.currentPerson)+'</b> \u00b7 '+days.size+' session'+(days.size===1?'':'s')+' \u00b7 '+rows.length+' exercise'+(rows.length===1?'':'s')+' \u00b7 '+Math.round(vol).toLocaleString()+' kg\u00b7reps'
     : '<div class="small muted">Nothing logged for '+escapeHtml(state.currentPerson)+' in this week.';
@@ -1252,10 +1332,21 @@ function sheet(name, headers){
 function rowsToObjects(name, headers){
   var s = sheet(name, headers);
   var values = s.getDataRange().getValues();
+  var tz = ss().getSpreadsheetTimeZone();
   var out = [];
   for(var i=1; i<values.length; i++){
     var o = {};
-    for(var c=0; c<headers.length; c++){ o[headers[c]] = values[i][c]; }
+    for(var c=0; c<headers.length; c++){
+      var v = values[i][c];
+      // Sheets auto-converts date-like text into real Date cells; convert them back
+      // to plain strings using the spreadsheet's timezone so no day-shift occurs.
+      if(Object.prototype.toString.call(v) === '[object Date]'){
+        v = (headers[c] === 'date')
+          ? Utilities.formatDate(v, tz, 'yyyy-MM-dd')
+          : Utilities.formatDate(v, tz, "yyyy-MM-dd'T'HH:mm:ss");
+      }
+      o[headers[c]] = v;
+    }
     if(o[headers[0]] === '' || o[headers[0]] === null) continue;
     out.push(o);
   }
